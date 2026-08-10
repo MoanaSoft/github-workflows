@@ -1,0 +1,206 @@
+name: PHP Package CI
+
+on:
+    workflow_call:
+        inputs:
+            php-version:
+                description: PHP version used by the package CI
+                required: false
+                type: string
+                default: "8.4"
+
+            php-extensions:
+                description: PHP extensions required by the package
+                required: false
+                type: string
+                default: "mbstring, intl, curl, zip, pdo_sqlite"
+
+            run-lint:
+                description: Run the package lint/style command
+                required: false
+                type: boolean
+                default: true
+
+            lint-command:
+                description: Command used for lint/style checks
+                required: false
+                type: string
+                default: "composer lint"
+
+            run-analysis:
+                description: Run static analysis
+                required: false
+                type: boolean
+                default: true
+
+            analysis-command:
+                description: Command used for static analysis
+                required: false
+                type: string
+                default: "composer analyse"
+
+            run-tests:
+                description: Run the package test suite
+                required: false
+                type: boolean
+                default: true
+
+            test-command:
+                description: Command used for the package test suite
+                required: false
+                type: string
+                default: "composer test"
+
+            run-security:
+                description: Run Composer dependency security audit
+                required: false
+                type: boolean
+                default: true
+
+            private-composer-auth:
+                description: Enable GitHub App authentication for private Composer repositories
+                required: false
+                type: boolean
+                default: false
+
+            private-composer-app-id:
+                description: GitHub App ID used to access private Composer repositories
+                required: false
+                type: string
+                default: ""
+
+            private-composer-owner:
+                description: GitHub owner containing the private Composer repositories
+                required: false
+                type: string
+                default: "MoanaSoft"
+
+            private-composer-repositories:
+                description: Repositories accessible through the private Composer GitHub App
+                required: false
+                type: string
+                default: ""
+
+        secrets:
+            PRIVATE_COMPOSER_APP_PRIVATE_KEY:
+                description: Private key for the GitHub App used for private Composer repositories
+                required: false
+
+permissions:
+    contents: read
+
+jobs:
+    package:
+        name: PHP Package
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+
+        env:
+            COMPOSER_NO_INTERACTION: "1"
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+            - name: Setup PHP
+              uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240
+              with:
+                  php-version: ${{ inputs.php-version }}
+                  extensions: ${{ inputs.php-extensions }}
+                  coverage: none
+                  tools: composer:v2
+
+            - name: Validate private Composer authentication
+              if: ${{ inputs.private-composer-auth }}
+              env:
+                  PRIVATE_COMPOSER_APP_ID: ${{ inputs.private-composer-app-id }}
+                  PRIVATE_COMPOSER_APP_PRIVATE_KEY: ${{ secrets.PRIVATE_COMPOSER_APP_PRIVATE_KEY }}
+                  PRIVATE_COMPOSER_OWNER: ${{ inputs.private-composer-owner }}
+                  PRIVATE_COMPOSER_REPOSITORIES: ${{ inputs.private-composer-repositories }}
+              run: |
+                  if [ -z "$PRIVATE_COMPOSER_APP_ID" ]; then
+                      echo "::error::private-composer-app-id is required when private Composer authentication is enabled."
+                      exit 1
+                  fi
+
+                  if [ -z "$PRIVATE_COMPOSER_APP_PRIVATE_KEY" ]; then
+                      echo "::error::PRIVATE_COMPOSER_APP_PRIVATE_KEY is required when private Composer authentication is enabled."
+                      exit 1
+                  fi
+
+                  if [ -z "$PRIVATE_COMPOSER_OWNER" ]; then
+                      echo "::error::private-composer-owner is required when private Composer authentication is enabled."
+                      exit 1
+                  fi
+
+                  if [ -z "$PRIVATE_COMPOSER_REPOSITORIES" ]; then
+                      echo "::error::private-composer-repositories is required when private Composer authentication is enabled."
+                      exit 1
+                  fi
+
+            - name: Create private Composer GitHub App token
+              if: ${{ inputs.private-composer-auth }}
+              id: private-composer-token
+              uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+              with:
+                  app-id: ${{ inputs.private-composer-app-id }}
+                  private-key: ${{ secrets.PRIVATE_COMPOSER_APP_PRIVATE_KEY }}
+                  owner: ${{ inputs.private-composer-owner }}
+                  repositories: ${{ inputs.private-composer-repositories }}
+                  permission-contents: read
+
+            - name: Configure private Composer GitHub access
+              if: ${{ inputs.private-composer-auth }}
+              env:
+                  PRIVATE_COMPOSER_TOKEN: ${{ steps.private-composer-token.outputs.token }}
+              run: |
+                  composer config --global github-oauth.github.com "$PRIVATE_COMPOSER_TOKEN"
+
+                  git config --global \
+                      url."https://x-access-token:${PRIVATE_COMPOSER_TOKEN}@github.com/".insteadOf \
+                      "git@github.com:"
+
+                  git config --global --add \
+                      url."https://x-access-token:${PRIVATE_COMPOSER_TOKEN}@github.com/".insteadOf \
+                      "ssh://git@github.com/"
+
+            - name: Show runtime versions
+              run: |
+                  php --version
+                  composer --version
+
+            - name: Validate Composer configuration
+              run: composer validate --strict
+
+            - name: Install Composer dependencies
+              run: composer install --no-interaction --prefer-dist --no-progress
+
+            - name: Validate PHP platform requirements
+              run: composer check-platform-reqs
+
+            - name: Validate PHP syntax
+              run: |
+                  git ls-files -z '*.php' |
+                      xargs -0 -r -n1 php -l
+
+            - name: Run lint and style checks
+              if: ${{ inputs.run-lint }}
+              env:
+                  CI_COMMAND: ${{ inputs.lint-command }}
+              run: bash -lc "$CI_COMMAND"
+
+            - name: Run static analysis
+              if: ${{ inputs.run-analysis }}
+              env:
+                  CI_COMMAND: ${{ inputs.analysis-command }}
+              run: bash -lc "$CI_COMMAND"
+
+            - name: Run test suite
+              if: ${{ inputs.run-tests }}
+              env:
+                  CI_COMMAND: ${{ inputs.test-command }}
+              run: bash -lc "$CI_COMMAND"
+
+            - name: Audit Composer dependencies
+              if: ${{ inputs.run-security }}
+              run: composer audit --no-interaction
