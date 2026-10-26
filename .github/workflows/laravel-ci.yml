@@ -1,0 +1,331 @@
+name: MoanaSoft Laravel CI
+
+on:
+    workflow_call:
+        inputs:
+            php-version:
+                description: PHP version used by the CI
+                required: false
+                type: string
+                default: "8.4"
+            php-extensions:
+                description: PHP extensions required by the application
+                required: false
+                type: string
+                default: "mbstring, intl, curl, zip, pdo_sqlite, pdo_mysql"
+            node-version:
+                description: Node.js version used for the frontend build
+                required: false
+                type: string
+                default: "24"
+            run-lint:
+                description: Run application style checks
+                required: false
+                type: boolean
+                default: true
+            lint-command:
+                description: Style check command for the calling application
+                required: false
+                type: string
+                default: "composer run-script lint --no-interaction --no-ansi"
+            run-analysis:
+                description: Run static analysis
+                required: false
+                type: boolean
+                default: true
+            analysis-command:
+                description: Static analysis command for the calling application
+                required: false
+                type: string
+                default: "composer run-script analyse --no-interaction --no-ansi"
+            test-command:
+                description: Application test suite command
+                required: false
+                type: string
+                default: "php vendor/bin/phpunit --configuration phpunit.xml --no-coverage --fail-on-warning --do-not-cache-result"
+            run-tests:
+                description: Run the Laravel test suite
+                required: false
+                type: boolean
+                default: true
+            run-frontend:
+                description: Run the npm frontend build (opt-in for backend-only applications)
+                required: false
+                type: boolean
+                default: false
+            frontend-composer-install:
+                description: Install production Composer dependencies in the frontend job before npm build
+                required: false
+                type: boolean
+                default: false
+            run-security:
+                description: Run dependency security checks
+                required: false
+                type: boolean
+                default: true
+            private-composer-auth:
+                description: Enable GitHub App authentication for private Composer repositories
+                required: false
+                type: boolean
+                default: false
+            private-composer-app-id:
+                description: GitHub App ID used for private Composer repositories
+                required: false
+                type: string
+                default: ""
+            private-composer-owner:
+                description: Owner of private Composer repositories
+                required: false
+                type: string
+                default: "MoanaSoft"
+            private-composer-repositories:
+                description: Repositories accessible through the private Composer GitHub App
+                required: false
+                type: string
+                default: ""
+        secrets:
+            PRIVATE_COMPOSER_APP_PRIVATE_KEY:
+                description: Private key for the GitHub App used by private Composer repositories
+                required: false
+
+permissions:
+    contents: read
+
+jobs:
+    php:
+        name: PHP / Laravel
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+
+        env:
+            APP_ENV: testing
+            APP_DEBUG: "false"
+            DB_CONNECTION: sqlite
+            DB_DATABASE: ":memory:"
+            DB_URL: ""
+            CACHE_STORE: array
+            SESSION_DRIVER: array
+            QUEUE_CONNECTION: sync
+            MAIL_MAILER: array
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+            - name: Setup PHP
+              uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240
+              with:
+                  php-version: ${{ inputs.php-version }}
+                  extensions: ${{ inputs.php-extensions }}
+                  coverage: none
+                  tools: composer:v2
+
+            - name: Validate private Composer authentication
+              if: ${{ inputs.private-composer-auth }}
+              env:
+                  PRIVATE_COMPOSER_APP_ID: ${{ inputs.private-composer-app-id }}
+                  PRIVATE_COMPOSER_APP_PRIVATE_KEY: ${{ secrets.PRIVATE_COMPOSER_APP_PRIVATE_KEY }}
+                  PRIVATE_COMPOSER_OWNER: ${{ inputs.private-composer-owner }}
+                  PRIVATE_COMPOSER_REPOSITORIES: ${{ inputs.private-composer-repositories }}
+              run: |
+                  if [ -z "$PRIVATE_COMPOSER_APP_ID" ]; then
+                      echo "::error::private-composer-app-id is required when private Composer authentication is enabled."
+                      exit 1
+                  fi
+
+                  if [ -z "$PRIVATE_COMPOSER_APP_PRIVATE_KEY" ]; then
+                      echo "::error::PRIVATE_COMPOSER_APP_PRIVATE_KEY is required when private Composer authentication is enabled."
+                      exit 1
+                  fi
+
+                  if [ -z "$PRIVATE_COMPOSER_OWNER" ]; then
+                      echo "::error::private-composer-owner is required when private Composer authentication is enabled."
+                      exit 1
+                  fi
+
+                  if [ -z "$PRIVATE_COMPOSER_REPOSITORIES" ]; then
+                      echo "::error::private-composer-repositories is required when private Composer authentication is enabled."
+                      exit 1
+                  fi
+
+            - name: Create private Composer GitHub App token
+              if: ${{ inputs.private-composer-auth }}
+              id: private-composer-token
+              uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+              with:
+                  app-id: ${{ inputs.private-composer-app-id }}
+                  private-key: ${{ secrets.PRIVATE_COMPOSER_APP_PRIVATE_KEY }}
+                  owner: ${{ inputs.private-composer-owner }}
+                  repositories: ${{ inputs.private-composer-repositories }}
+                  permission-contents: read
+
+            - name: Configure private Composer GitHub access
+              if: ${{ inputs.private-composer-auth }}
+              env:
+                  PRIVATE_COMPOSER_TOKEN: ${{ steps.private-composer-token.outputs.token }}
+              run: |
+                  composer config --global github-oauth.github.com "$PRIVATE_COMPOSER_TOKEN"
+                  git config --global url."https://x-access-token:${PRIVATE_COMPOSER_TOKEN}@github.com/".insteadOf "git@github.com:"
+                  git config --global --add url."https://x-access-token:${PRIVATE_COMPOSER_TOKEN}@github.com/".insteadOf "ssh://git@github.com/"
+
+            - name: Show PHP and Composer versions
+              run: |
+                  php --version
+                  composer --version
+
+            - name: Prepare Laravel environment
+              run: |
+                  if [ ! -f .env.example ]; then
+                      echo "::error::.env.example is required for the Laravel CI"
+                      exit 1
+                  fi
+
+                  cp .env.example .env
+                  chmod 600 .env
+
+            - name: Validate Composer configuration
+              run: composer validate
+
+            - name: Install Composer dependencies
+              run: composer install --no-interaction --prefer-dist --no-progress
+
+            - name: Validate PHP platform requirements
+              run: composer check-platform-reqs --lock
+
+            - name: Generate application key
+              run: php artisan key:generate --ansi
+
+            - name: Compile Laravel views
+              run: php artisan view:cache
+
+            - name: Validate Laravel routes
+              run: php artisan route:list
+
+            - name: Check PHP formatting
+              if: ${{ inputs.run-lint }}
+              env:
+                  CI_COMMAND: ${{ inputs.lint-command }}
+              run: bash -lc "$CI_COMMAND"
+
+            - name: Static analysis
+              if: ${{ inputs.run-analysis }}
+              env:
+                  CI_COMMAND: ${{ inputs.analysis-command }}
+              run: bash -lc "$CI_COMMAND"
+
+            - name: Run Laravel tests
+              if: ${{ inputs.run-tests }}
+              env:
+                  CI_COMMAND: ${{ inputs.test-command }}
+              run: bash -lc "$CI_COMMAND"
+
+    frontend:
+        name: Frontend
+        if: ${{ inputs.run-frontend }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+            - name: Setup PHP for Composer-backed frontend assets
+              if: ${{ inputs.frontend-composer-install }}
+              uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240
+              with:
+                  php-version: ${{ inputs.php-version }}
+                  extensions: ${{ inputs.php-extensions }}
+                  coverage: none
+                  tools: composer:v2
+
+            - name: Validate private Composer authentication for frontend
+              if: ${{ inputs.frontend-composer-install && inputs.private-composer-auth }}
+              env:
+                  PRIVATE_COMPOSER_APP_ID: ${{ inputs.private-composer-app-id }}
+                  PRIVATE_COMPOSER_APP_PRIVATE_KEY: ${{ secrets.PRIVATE_COMPOSER_APP_PRIVATE_KEY }}
+                  PRIVATE_COMPOSER_OWNER: ${{ inputs.private-composer-owner }}
+                  PRIVATE_COMPOSER_REPOSITORIES: ${{ inputs.private-composer-repositories }}
+              run: |
+                  if [ -z "$PRIVATE_COMPOSER_APP_ID" ]; then
+                      echo "::error::private-composer-app-id is required when private Composer authentication is enabled."
+                      exit 1
+                  fi
+
+                  if [ -z "$PRIVATE_COMPOSER_APP_PRIVATE_KEY" ]; then
+                      echo "::error::PRIVATE_COMPOSER_APP_PRIVATE_KEY is required when private Composer authentication is enabled."
+                      exit 1
+                  fi
+
+                  if [ -z "$PRIVATE_COMPOSER_OWNER" ]; then
+                      echo "::error::private-composer-owner is required when private Composer authentication is enabled."
+                      exit 1
+                  fi
+
+                  if [ -z "$PRIVATE_COMPOSER_REPOSITORIES" ]; then
+                      echo "::error::private-composer-repositories is required when private Composer authentication is enabled."
+                      exit 1
+                  fi
+
+            - name: Create private Composer GitHub App token for frontend
+              if: ${{ inputs.frontend-composer-install && inputs.private-composer-auth }}
+              id: frontend-private-composer-token
+              uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+              with:
+                  app-id: ${{ inputs.private-composer-app-id }}
+                  private-key: ${{ secrets.PRIVATE_COMPOSER_APP_PRIVATE_KEY }}
+                  owner: ${{ inputs.private-composer-owner }}
+                  repositories: ${{ inputs.private-composer-repositories }}
+                  permission-contents: read
+
+            - name: Configure private Composer GitHub access for frontend
+              if: ${{ inputs.frontend-composer-install && inputs.private-composer-auth }}
+              env:
+                  PRIVATE_COMPOSER_TOKEN: ${{ steps.frontend-private-composer-token.outputs.token }}
+              run: |
+                  composer config --global github-oauth.github.com "$PRIVATE_COMPOSER_TOKEN"
+                  git config --global url."https://x-access-token:$PRIVATE_COMPOSER_TOKEN@github.com/".insteadOf "git@github.com:"
+                  git config --global --add url."https://x-access-token:$PRIVATE_COMPOSER_TOKEN@github.com/".insteadOf "ssh://git@github.com/"
+
+            - name: Install Composer dependencies for frontend assets
+              if: ${{ inputs.frontend-composer-install }}
+              run: composer install --no-interaction --prefer-dist --no-progress --no-dev --no-scripts
+
+            - name: Require npm lockfile
+              run: |
+                  if [ ! -f package-lock.json ]; then
+                      echo "::error::package-lock.json is required. CI frontend builds must be reproducible."
+                      exit 1
+                  fi
+
+            - name: Setup Node.js
+              uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+              with:
+                  node-version: ${{ inputs.node-version }}
+                  cache: npm
+                  cache-dependency-path: package-lock.json
+
+            - name: Install frontend dependencies
+              run: npm ci
+
+            - name: Build frontend
+              run: npm run build
+
+    security:
+        name: Security
+        if: ${{ inputs.run-security }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+            - name: Setup PHP
+              uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240
+              with:
+                  php-version: ${{ inputs.php-version }}
+                  coverage: none
+                  tools: composer:v2
+
+            - name: Audit Composer dependencies
+              run: composer audit --locked
